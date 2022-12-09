@@ -3,11 +3,12 @@ class Potential:
     """ Interface of potential class.
     """
 
-    def __init__(self, dim=2, kdim=2, *params):
+    def __init__(self, dim=2, kdim=2, jdim=None, *params):
         """ `potential_params` in command args will be passed to `params`.
         """
         self.dim = dim
         self.kdim = kdim
+        self.jdim = jdim 
 
     def get_H(self, R):
         """ 
@@ -19,7 +20,7 @@ class Potential:
         return None
 
     def get_kdim(self):
-        """ Return kinetic dimension
+        """ Return cartisian kinetic dimension
         """
         return self.kdim
 
@@ -27,6 +28,11 @@ class Potential:
         """ Return the electronic dimension
         """
         return self.dim
+    
+    def get_jdim(self):
+        """ Return the jacobi angular dimension
+        """
+        return self.jdim
 
     def has_get_phase(self):
         return False

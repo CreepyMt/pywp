@@ -25,7 +25,7 @@ class Tully1(pywp.Potential):
         return H
 
     def has_get_phase(self):
-        return True
+        return False
 
 myapp = pywp.Application(Tully1)
 myapp.parse_args()

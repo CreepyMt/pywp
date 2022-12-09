@@ -132,7 +132,7 @@ def expm_batch(M:np.ndarray, dt:float):
     """ Calculating exp(-1j*M*dt).
     """
     D, U = np.linalg.eigh(M)
-    DD = np.zeros_like(U)
+    DD = np.zeros_like(U,dtype=complex)
     for j in range(D.shape[-1]):
         DD[..., j, j] = np.exp(-1j*dt*D[..., j])
 
