@@ -22,7 +22,7 @@ def index_along2(arr, ind1, axis1, ind2, axis2):
 class PhysicalParameter:
     """ Represents the physical parameters that to use.
     """
-    def __init__(self, Psi, H, KE, TU, VU, VUhalf, R, K, dA:float, dK:float, dt:float):
+    def __init__(self, Psi, H, KE, TU, VU, VUhalf, R, K, dA:float, dK:float, dt:float, JU=None):
         self.Psi = Psi
         self.H = H
         self.KE = KE
@@ -34,9 +34,9 @@ class PhysicalParameter:
         self.dA = dA
         self.dK = dK
         self.dt = dt
+        self.JU = JU
 
-
-def preprocess(potential:Potential, N, L, wp_generator, c0, M:float, dt:float) -> PhysicalParameter:
+def preprocess(potential:Potential, N, L, wp_generator, c0, M, dt:float) -> PhysicalParameter:
     """ Produce things needed for propatate(). Only two electronic states (potential.dim() == 2) are supported currently.
 
     potential: Class compatible with potential.Potential.
@@ -51,6 +51,11 @@ def preprocess(potential:Potential, N, L, wp_generator, c0, M:float, dt:float) -
 
     nel = potential.get_dim()
     nk = potential.get_kdim()
+    nj = potential.get_jdim()
+    if nj is not None:
+        nc = nk - nj # number of cartesian coordinates
+    else:
+        nc = nk # number of cartesian coordinates
 
     if isinstance(N, int):
         N = [N]*nk
@@ -59,24 +64,45 @@ def preprocess(potential:Potential, N, L, wp_generator, c0, M:float, dt:float) -
     if isinstance(L, (float, int)):
         L = [L]*nk
     else:
-        assert len(L) == nk
+        assert len(L) == nc
+        assert len(M) == nc
 
     r = []
     k = []
     dA = 1.0
     dK = 1.0
-    for j in range(nk):
+    for j in range(nc):
         r.append(np.linspace(-L[j]/2, L[j]/2, N[j]))
         dr = L[j] / (N[j] - 1)
         k.append(np.fft.fftfreq(N[j], dr) * 2* np.pi)
         dA *= dr
         dK *= L[j] / (N[j] - 1) / N[j]
 
+    # generate Legendre-Gauss quadrature points and weights for angular momentum part
+    l_root, l_weight = np.polynomial.legendre.leggauss(N[-1])
+    if nj is not None:
+        r.append(np.arccos(l_root))
+        k.append(np.arange(0,N[-1],1))
+
+        # prepare DVR to FBR transformation matrix for angular momentum part
+        JU = np.zeros([N[-1],N[-1]]) 
+        for i in range(N[-1]):
+            for j in range(N[-1]):
+                coef = np.zeros(N[-1])
+                coef[i] += 1 
+                JU[i,j] = np.sqrt(l_weight[j])*np.polynomial.legendre.legval(l_root[j],coef)*np.sqrt((2*i+1)/2)
+    else:
+        JU = None 
+
     R = np.meshgrid(*r, indexing='ij')
     K = np.meshgrid(*k, indexing='ij')
     
     Psi = np.zeros(list(N) + [nel], dtype=complex)
-    psi0 = wp_generator(R)
+    if nj is not None:
+        psi0 = wp_generator(R,JU)   
+    else:
+        psi0 = wp_generator(R) 
+
     if isinstance(c0, int):
         Psi[..., c0] = psi0
     else:
@@ -89,8 +115,14 @@ def preprocess(potential:Potential, N, L, wp_generator, c0, M:float, dt:float) -
     H = potential.get_H(R)
 
     assert H.shape == tuple(list(N) + [nel, nel])
+    
+    if nj is not None:
+        KE = sum((K_**2 /2/M_) for (K_,M_) in zip(K[:-1],M)) 
+        I = 1/sum((1/R_**2/M_) for (R_,M_) in zip(R[:-1],M)) 
+        KE += K[-1]*(K[-1]+1)/2/I
+    else:
+        KE = sum((K_**2 /2/M_) for (K_,M_) in zip(K,M)) 
 
-    KE = sum((K_**2 for K_ in K))/2/M
     TU = np.exp(-1j*dt*KE)
 
     # superfast eigenvalue for nel == 2
@@ -131,8 +163,8 @@ def preprocess(potential:Potential, N, L, wp_generator, c0, M:float, dt:float) -
     else:
         VU = expm_batch(H, dt)
         VUhalf = expm_batch(H, dt/2)
-
-    return PhysicalParameter(Psi, H, KE, TU, VU, VUhalf, R, K, dA, dK, dt)
+        
+    return PhysicalParameter(Psi, H, KE, TU, VU, VUhalf, R, K, dA, dK, dt, JU)
 
 
 def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=None, partition_titles=None, analyzer=None, trajfile=None, checkend=False, boundary=None, checkend_rtol=0.05, verbose=True, cuda_backend=False) -> list:
@@ -162,7 +194,7 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
     extra is a list containing the return of each analyzer.
     """
 
-    Psi = para.Psi; H = para.H; KE = para.KE; TU = para.TU; VU = para.VU; VUhalf = para.VUhalf; R = para.R; K = para.K; dA = para.dA; dK = para.dK; dt = para.dt
+    Psi = para.Psi; H = para.H; KE = para.KE; TU = para.TU; VU = para.VU; VUhalf = para.VUhalf; R = para.R; K = para.K; dA = para.dA; dK = para.dK; dt = para.dt; JU=para.JU
 
     _tp_axes = list(range(len(VUhalf.shape)))
     _tp_axes[-1], _tp_axes[-2] = _tp_axes[-2], _tp_axes[-1]
@@ -209,6 +241,7 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
                     p1[index_along(p1, j, -1)] = np.sum(v[index_along(v, j, -2)] * p, axis=nk)
                 return p1
 
+    # first Half VU 
     Psi = dot_v(VUhalf, Psi)
 
     result = []
@@ -218,11 +251,11 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
         mom_titles = 'xyz'[:nk]
         if not partition_titles:
             partition_titles = 'ABCDEFGHIJKLMNOPQ'[:len(partition_filter)]
-        print('t\tE\tKE\tTotal', end='')
-        print(''.join(('\t%s%d' % (x[1], x[0]) for x in itertools.product(range(nel), partition_titles))), end='')
+        print('t\t\tE\t\tKE\t\tTotal', end='')
+        print(''.join(('\t\t%s%d' % (x[1], x[0]) for x in itertools.product(range(nel), partition_titles))), end='')
         if verbose == 2:
-            print(''.join(('\t%s%s%d' % (x[2], x[1], x[0]) for x in itertools.product(range(nel), partition_titles, pos_titles))) 
-                + ''.join(('\tP%s%s%d' % (x[2], x[1], x[0]) for x in itertools.product(range(nel), partition_titles, mom_titles)))
+            print(''.join(('\t\t%s%s%d' % (x[2], x[1], x[0]) for x in itertools.product(range(nel), partition_titles, pos_titles))) 
+                + ''.join(('\t\tP%s%s%d' % (x[2], x[1], x[0]) for x in itertools.product(range(nel), partition_titles, mom_titles)))
             )
         else:
             print('')
@@ -234,7 +267,11 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
                 Psi /= (_backend.sum(abs2(Psi))* dA)**0.5
 
             Psi_output = dot_v(VUhalfinv, Psi)
-            Psip = [_backend.fft.fftn(Psi_output[index_along(Psi, j, -1)], axes=tuple(range(nk))) for j in range(nel)]
+            if JU is not None:
+                Psip = [_backend.fft.fftn(Psi_output[index_along(Psi, j, -1)], axes=tuple(range(nk-1))) for j in range(nel)]
+                Psip = [_backend.einsum('jk,...k->...j',JU, Psip_) for Psip_ in Psip]
+            else:
+                Psip = [_backend.fft.fftn(Psi_output[index_along(Psi, j, -1)], axes=tuple(range(nk))) for j in range(nel)]
 
             Rhoave = []
             Rave = []
@@ -244,7 +281,7 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
             for j in range(nel):
                 for pf in partition_filter:
                     abspsi = abs2(Psi_output[index_along(Psi_output, j, -1)]) * pf
-                    
+
                     abspsip = abs2(_backend.fft.fftn(Psi_output[index_along(Psi_output, j, -1)] * pf, axes=tuple(range(nk))))
                     if cuda_backend:
                         Rhoave.append(_backend.sum(abspsi).get() * dA)
@@ -277,19 +314,26 @@ def propagate(para:PhysicalParameter, nstep:int, output_step:int, partitioner=No
                     _backend.fft.fftshift(psip).tofile(trajfile)
 
             if verbose:
-                print('%.8g\t%.8g\t%.8g\t%.8g' % (i*dt, Eave, KEave, Rhotot), end='')
-                print(''.join(('\t%.8g' % x for x in Rhoave)), end='')
+                print('%.4e\t%.4e\t%.4e\t%.4e' % (i*dt, Eave, KEave, Rhotot), end='')
+                print(''.join(('\t%.4e' % x for x in Rhoave)), end='')
                 if verbose == 2:
-                    print(''.join(('\t%.8g' % x for x in Rave)) + ''.join(('\t%.8g' % x for x in Pave)))
+                    print(''.join(('\t%.4e' % x for x in Rave)) + ''.join(('\t%.4e' % x for x in Pave)))
                 else:
                     print('')
 
             if checkend and _backend.sum((boundary_filter * _backend.sum(abs2(Psi), axis=-1)))*dA < 1 - checkend_rtol:
-                break
-
+                #break
+                pass
+        
+        Psip = [_backend.fft.fftn(Psi[index_along(Psi, j, -1)], axes=tuple(range(nk-1))) for j in range(nel)]
+        Psip = [_backend.einsum('jk,...k->...j',JU, Psip_) for Psip_ in Psip]
         for j in range(nel):
-            Psi[index_along(Psi, j, -1)] = _backend.fft.ifftn(
-                _backend.fft.fftn(Psi[index_along(Psi, j, -1)], axes=tuple(range(nk)))*TU, axes=tuple(range(nk)))
+            if JU is not None:
+                Psi[index_along(Psi, j, -1)] = _backend.fft.ifftn(Psip[j]*TU, axes=tuple(range(nk-1)))
+                Psi[index_along(Psi, j, -1)] = _backend.einsum('jk,...k->...j',JU.T.conj(), Psi[index_along(Psi, j, -1)]) 
+            else:
+                Psi[index_along(Psi, j, -1)] = _backend.fft.ifftn(
+                    _backend.fft.fftn(Psi[index_along(Psi, j, -1)], axes=tuple(range(nk)))*TU, axes=tuple(range(nk)))
         Psi = dot_v(VU, Psi)
 
     return result
